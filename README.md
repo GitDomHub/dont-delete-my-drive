@@ -1,5 +1,7 @@
 # dont-delete-my-drive
 
+![Don't delete my drive: a safety hook for Claude Code that blocks rm -rf on your home folder before it runs](assets/cover.jpg)
+
 A safety hook for [Claude Code](https://claude.com/claude-code). It reads every shell command before it runs and refuses the ones that would wipe your disk, your home folder, your project, an external drive or your backups.
 
 One command to install. Nothing to configure. macOS and Linux.
@@ -28,16 +30,18 @@ Every command ends one of three ways. Blocked: Claude can't run it, and is told 
 
 | Blocked | Asks you first | Runs as normal |
 |---|---|---|
-| `rm -rf` on `/`, `~`, `~/Documents`, `~/Desktop`, `~/Library`, `~/.ssh` and the other folders that hold your life | `rm -rf` on any other folder, unless it is a temp or build folder | `rm file.txt` |
+| `rm -rf` on `/`, `~`, `~/Documents`, `~/Desktop`, `~/Library`, `~/.ssh` and the other folders that hold your life | `rm -rf` on any other existing folder, unless it is a temp or build folder or every file in it is committed in git | `rm file.txt`, `rm -f *.bak`, `find . -name '*.tmp' -delete` |
 | deleting the folder Claude is working in, or any folder above it | `rm -rf "$DIR/"` when the variable can't be resolved (an empty one turns it into `/`) | `rm -rf node_modules`, `dist`, `build`, `.next`, `target`, `.venv` |
-| any external drive or mounted volume | `find . -name '*.bak' -delete` | `rm -rf /tmp/anything` |
-| `find ~ -delete`, `rsync --delete` onto those folders, `mv` of those folders | `xargs rm -rf` | `git push`, `git branch -d` (merged) |
-| `sudo` and `doas` | `git reset --hard`, `git clean -f`, `git push --force`, `git branch -D`, `git checkout -- .`, `git stash drop` | `git clean -n`, `git restore --staged` |
-| `diskutil erase*`, `dd` or `>` onto `/dev/disk*`, `mkfs`, `newfs`, `wipefs`, `fdisk`, `diskpart`, `Format-Volume` | `shutil.rmtree`, `fs.rmSync`, `DROP TABLE`, `wrangler ... delete`, `aws s3 rm`, `docker system prune` | `diskutil list`, `tmutil latestbackup` |
-| deleting Time Machine snapshots, emptying the Trash | `shred`, `crontab -r`, `security delete-*` | `mv draft.md archive/`, `trash old.md` |
+| any external drive or mounted volume | a project's `.git` or `.claude` folder | `rm -rf /tmp/anything`, `rm -rf a-folder-that-does-not-exist` |
+| `find ~ -delete`, `rsync --delete` onto those folders, `mv` of those folders | `xargs rm -rf` | `git push`, `git branch -d x && git push origin --delete x` |
+| `sudo` and `doas` | `git reset --hard`, `git clean -f`, `git push --force`, `git branch -D`, `git checkout -- .`, `git stash drop` | `git clean -n`, `git restore --staged`, `git checkout -- one-file.md` |
+| `diskutil erase*`, `dd` or `>` onto `/dev/disk*`, `mkfs`, `newfs`, `wipefs`, `fdisk`, `diskpart`, `Format-Volume` | `shutil.rmtree` or `fs.rmSync` in a script that also names your home folder or a drive, `DROP TABLE`, `wrangler ... delete`, `aws s3 rm`, `docker system prune` | `diskutil list`, `tmutil latestbackup` |
+| deleting Time Machine snapshots, emptying the Trash | `shred`, `crontab -r`, `security delete-*` | `mv` and renames inside your projects, `trash old.md` |
 | `gh repo delete` | editing this hook or `~/.claude/settings*.json` | `echo "rm -rf ~"`, `git commit -m "rm -rf / is scary"` |
 
 It looks through `sudo`, `bash -c '...'`, `eval`, `ssh host '...'`, `osascript "do shell script"`, `$(...)` and backtick subshells, here-docs piped into a shell, `cd` before the delete, `~`, `$HOME`, and variables set earlier in the same command. `D=~/Documents && rm -rf $D` is blocked. `rm -rf "$UNSET/"` asks. Quoted strings, comments and plain here-docs are data, so the two examples in the last row run without a prompt.
+
+Two things keep it quiet during normal work. A folder that does not exist is nothing to delete, so `rm -rf old-clone && git clone ...` runs when `old-clone` is already gone. A folder whose files are all committed in git can be restored, so deleting it runs too; one untracked or modified file in there and it asks.
 
 When a command can't be parsed (unbalanced quotes, say) the hook falls back to pattern matching. When the hook itself crashes, or Python is missing, every shell command is blocked rather than waved through, and the error tells you why.
 
@@ -68,7 +72,7 @@ Create `~/.claude/dont-delete-my-drive.json`:
 }
 ```
 
-`protected` lists folders Claude may never delete or move, along with everything inside them (build folders like `node_modules` are still fine) and any folder that contains them. A single file inside one asks instead of blocking.
+`protected` lists folders Claude may never delete or move, nor any folder that contains them. Their top two levels of subfolders are blocked too (for a vault, that is the areas and the projects). Deeper inside, normal project rules apply, and moves and renames are fine anywhere. A single file in a top level asks instead of blocking.
 
 `safe_to_delete_in` lists folders where recursive deletes run without a prompt, like `/tmp`. Your home folder and anything above it are ignored here on purpose.
 
@@ -90,7 +94,9 @@ Create `~/.claude/dont-delete-my-drive.json`:
 python3 test_dont_delete_my_drive.py
 ```
 
-165 cases: commands that must be blocked, commands that must ask, commands that must run without a prompt. Add yours.
+215 cases: commands that must be blocked, commands that must ask, commands that must run without a prompt. Add yours.
+
+The rules were tuned against a replay of 46 real Claude Code sessions, about 6,000 shell commands. Version 1.0 flagged 1.5% of them and roughly two thirds of those were unnecessary: renames, wildcard file deletes, merged-branch cleanup. Version 1.1 flags a third as many.
 
 ## Uninstall
 

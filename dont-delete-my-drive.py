@@ -19,7 +19,7 @@ import re
 import shlex
 import sys
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 HOME = os.path.normpath(os.path.expanduser("~"))
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude")
@@ -111,18 +111,32 @@ RAW_CHECKS = [
     (ASK, re.compile(r"\b(rd|rmdir)\s+(/\w\s+)*/s\b|\bdel\s+(/\w\s+)*/s\b"
                      r"|\bRemove-Item\b[^\n;|&]*-Recurse", re.I),
      "a recursive Windows delete"),
-    (ASK, re.compile(r"shutil\.rmtree|os\.removedirs|\brmSync\b|\bfs\.rm(dir)?(Sync)?\s*\("
-                     r"|FileUtils\.rm_r|\bremove_dir_all\b|\bos\.RemoveAll\b", re.I),
-     "a script that deletes folders"),
     (ASK, re.compile(r"\b(DROP\s+(TABLE|DATABASE|SCHEMA)|TRUNCATE\s+TABLE)\b", re.I),
      "SQL that drops or empties a table"),
     (ASK, re.compile(r"disableAllHooks"),
      "the setting that switches off every hook, this guard included"),
 ]
 GUARD_FILES = re.compile(r"\.claude/(settings(\.local)?\.json|hooks/|dont-delete-my-drive\.json)")
-WRITE_HINT = re.compile(
-    r"(?<![0-9&])>(?!&)|\bsed\s+-i|\bperl\s+-\w*i|\b(mv|rm|cp|tee|truncate|ln|chmod|"
-    r"chflags|install|rsync|ditto|python3?|node|ruby|osascript|trash)\b")
+# Commands that change a file they are given as an argument.
+FILE_WRITERS = {"mv", "rm", "cp", "tee", "truncate", "ln", "chmod", "chflags", "install",
+                "rsync", "ditto", "trash", "sed", "perl", "unlink", "shred", "srm"}
+SCRIPT_WRITE = re.compile(r"open\([^)]*[\"'][wa]|write_text|writeFile|json\.dump\(|\.write\(|File\.write")
+# A script that deletes folders only worries us when it also reaches for the home folder,
+# a drive root or a protected folder. Relative project paths are normal build-script work.
+RMTREE = re.compile(r"shutil\.rmtree|os\.removedirs|\brmSync\b|\bfs\.rm(dir)?(Sync)?\s*\("
+                    r"|FileUtils\.rm_r|\bremove_dir_all\b|\bos\.RemoveAll\b", re.I)
+RISKY_ROOT = re.compile(
+    r"expanduser\(\s*[\"']~(/[^/\"']+)?[\"']\s*\)|Path\.home\(\)(?!\s*/)|\$HOME(?![/\w])|environ\[[\"']HOME|USERPROFILE"
+    r"|/(Users|home)/[^/\s\"']+(/[^/\s\"']+)?/?(?=[\"'\s)]|$)"      # the home folder or one level in
+    r"|[A-Za-z]:\\\\(?=[\"'\s)])|[\"']/[\"']"
+    r"|/(Volumes|mnt|media)/[^/\s\"']+/?(?=[\"'\s)]|$)")
+# Shell keywords that can sit in front of a command inside a segment.
+KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "!", "{", "}", "done", "fi", "esac", "time"}
+# Evidence, anywhere in the command, that a branch was checked as merged before being deleted.
+MERGE_CHECK = re.compile(r"git branch -d\b|git branch --merged|merge-base --is-ancestor|gh pr merge\b"
+                         r"|gh pr list[^;|&]*--state merged|git log[^;|&]*\S\.\.\S")
+CD_ARG = re.compile(r"\bcd\s+(\"[^\"]*\"|'[^']*'|\S+)")
+MKTEMP_ASSIGN = re.compile(r"\b([A-Za-z_]\w*)=(\$\(|`)\s*mktemp\b[^)`]*[)`]")
 # Used only when the command can't be parsed (unbalanced quotes and the like).
 FALLBACK_CHECKS = [
     (ASK, re.compile(r"(^|[\s;&|(`])(sudo|doas)\s"), "what looks like sudo in a command the guard couldn't parse"),
@@ -170,6 +184,10 @@ class Findings:
     def __init__(self, cwd):
         self.cwd = cwd
         self.vars = {}  # VAR=value set earlier in the same command; None = unknown
+        self.cwd_trusted = True  # False after a cd to a relative path we may have mis-tracked
+        self.merged_branch_delete = False  # a `git branch -d` (merged only) appeared earlier
+        self.cloned = False  # a `git clone` appeared earlier in the same command
+        self.loops = {}  # for VAR in a b c: the values VAR takes
         self.level = ALLOW
         self.reasons = {ASK: [], DENY: []}
 
@@ -236,10 +254,11 @@ def glob_base(path):
     return path, False
 
 
-def classify(path):
+def classify(path, moving=False):
     """Risk of deleting path and everything under it: (level, reason, hard).
 
     hard=True means a name filter never softens the verdict to ask.
+    moving=True judges a move or rename (recoverable), so only the big trees count.
     """
     if path == "/":
         return DENY, "the whole disk (/)", True
@@ -255,52 +274,109 @@ def classify(path):
         return DENY, "the top-level folder %s" % path, True
     if MOUNT_ROOT.match(path) and path.count("/") <= 3 or WSL_WINDOWS.match(path):
         return DENY, "an external drive or mounted volume (%s)" % path, True
+    parent, name = os.path.split(path)
+    if parent != HOME and REGENERABLE.intersection(path.split("/")):
+        return ALLOW, "", False
     for folder in PROTECTED:
         if inside(folder, path):
             if folder == path:
-                return DENY, short(folder), False
-            return DENY, "%s, which holds %s" % (short(path), short(folder)), False
+                return DENY, short(folder), True
+            return DENY, "%s, which holds %s" % (short(path), short(folder)), True
         if inside(path, folder):
-            if REGENERABLE.intersection(path[len(folder):].split("/")):
-                return ALLOW, "", False
-            return DENY, "%s, inside protected %s" % (short(path), short(folder)), False
-    parent, name = os.path.split(path)
+            if path[len(folder):].count("/") <= 2:
+                level = ASK if moving else DENY
+                return level, "%s, a top folder of protected %s" % (short(path), short(folder)), False
+            break  # deeper inside a protected folder: normal project rules below
     if parent == HOME:
         if name in PROTECTED_HOME_CHILDREN:
-            return DENY, "~/" + name, False
+            return DENY, "~/" + name, True
+        if moving:
+            return ALLOW, "", False
         return ASK, "~/%s, a folder directly in your home" % name, False
-    if inside(path, os.path.join(HOME, ".claude")):
-        return ASK, "Claude's own config (%s)" % short(path), False
-    if REGENERABLE.intersection(path.split("/")):
+    if moving:
         return ALLOW, "", False
+    if name in (".git", ".claude"):
+        return ASK, "%s (%s history or config)" % (short(path), name.lstrip(".")), False
+    if inside(path, CLAUDE_DIR):
+        return ASK, "Claude's own config (%s)" % short(path), False
     return ASK, "%s (hard to undo; an archive folder or the Trash is safer)" % short(path), False
 
 
-def worst(path):
+def worst(path, moving=False):
     """classify() on the path and on where its symlinks really lead."""
-    verdict = classify(path)
+    verdict = classify(path, moving)
     real = os.path.realpath(path)
     if real != path:
-        other = classify(real)
+        other = classify(real, moving)
         if other[0] > verdict[0]:
             return other
     return verdict
 
 
-def judge(raw, ctx, filtered=False):
-    """Risk of recursively deleting raw: (level, reason)."""
+def git_clean(path):
+    """True if path is a folder in a git work tree with every file tracked and unchanged."""
+    import subprocess
+    try:
+        def git(*args):
+            return subprocess.run(["git", "-C", path, *args], capture_output=True, text=True,
+                                  timeout=5).stdout.strip()
+        if git("rev-parse", "--is-inside-work-tree") != "true":
+            return False
+        if git("status", "--porcelain", "--untracked-files=all", "--ignored", "--", "."):
+            return False
+        return bool(git("ls-files", "--", "."))
+    except Exception:
+        return False
+
+
+def judge(raw, ctx, filtered=False, moving=False, recursive=True, _depth=0):
+    """Risk of recursively deleting (or moving) raw: (level, reason)."""
     path, problem = resolve(raw, ctx.cwd, ctx.vars)
     if path is None:
+        match = SHELL_VAR.search(raw)
+        name = match and (match.group(1) or match.group(2))
+        if name in ctx.loops and _depth < 3:  # judge every value the loop variable takes
+            level, reason = ALLOW, ""
+            for value in ctx.loops[name][:50]:
+                lvl, rsn = judge(raw.replace(match.group(0), value), ctx, filtered, moving, recursive, _depth + 1)
+                if lvl > level:
+                    level, reason = lvl, rsn
+            return level, reason
+        if raw.rstrip("/").rsplit("/", 1)[-1] in REGENERABLE:
+            return ALLOW, ""  # whatever the prefix is, it ends in build output
         return ASK, problem
     base, name_filter = glob_base(path)
-    level, reason, hard = worst(base)
-    if level == DENY and not hard and not name_filter and os.path.isfile(base):
-        level, reason = ASK, "the single file %s" % short(base)  # one file, not a tree
+    if filtered or name_filter:
+        return judge_contents(base, recursive)
+    level, reason, hard = worst(base, moving)
     if level < DENY and ctx.cwd and not in_temp(ctx.cwd) and inside(ctx.cwd, base):
-        level, reason, hard = DENY, "the folder Claude is working in, or one above it (%s)" % short(base), False
-    if level == DENY and (filtered or name_filter) and not hard:
-        level = ASK
+        return DENY, "the folder Claude is working in, or one above it (%s)" % short(base)
+    if hard or moving or level == ALLOW:
+        return level, reason
+    if os.path.isfile(base):  # one file, not a tree: a top folder of a protected area still asks
+        return (ASK, "the single file %s" % short(base)) if level == DENY else (ALLOW, "")
+    if not os.path.lexists(base) and (ctx.cwd_trusted or raw.startswith(("/", "~", "$"))):
+        return ALLOW, ""  # nothing there to delete
+    if level == ASK and ctx.cloned and os.path.basename(base) == ".git":
+        return ALLOW, ""  # the .git of a clone made earlier in this same command
+    if level == ASK and os.path.isdir(base) and git_clean(base):
+        return ALLOW, ""  # every file is committed in git, so it can be restored
     return level, reason
+
+
+def judge_contents(base, recursive):
+    """Risk of deleting the files matching a pattern under base (rm *.log, find -name)."""
+    level, reason, hard = worst(base)
+    if base in TEMP_ROOTS or level == ALLOW:
+        return ALLOW, ""
+    for folder in PROTECTED:  # files by pattern inside a project of a protected area are fine
+        if inside(base, folder) and base != folder and base[len(folder):].count("/") >= 2:
+            return ALLOW, ""
+    if hard:
+        return (DENY if recursive else ASK), "files matching a pattern under %s" % reason
+    if level == DENY:
+        return ASK, "files matching a pattern under %s" % reason
+    return ALLOW, ""
 
 
 def positional(args):
@@ -324,17 +400,17 @@ def check_rm(args, ctx, via, verb="rm", recursive=False):
         ctx.add(ASK, "%s fed by xargs, so the guard can't see what it deletes" % verb)
         return
     for t in targets:
-        if recursive:
-            level, reason = judge(t, ctx)
+        if recursive:  # a glob still only matches one folder level, so recursive=False there
+            level, reason = judge(t, ctx, recursive=False)
             ctx.add(level, "%s -r on %s" % (verb, reason))
         elif GLOB_CHARS.intersection(t):
-            level, reason = judge(t, ctx, filtered=True)
-            ctx.add(min(level, ASK), "%s with a wildcard in %s" % (verb, reason))
+            level, reason = judge(t, ctx, filtered=True, recursive=False)
+            ctx.add(level, "%s with a wildcard on %s" % (verb, reason))
 
 
 def check_trash(args, ctx, via):
     for t in positional(args):
-        level, reason = judge(t, ctx)
+        level, reason = judge(t, ctx, moving=True)
         if level == DENY:
             ctx.add(DENY, "trash on " + reason)
 
@@ -344,7 +420,7 @@ def check_mv(args, ctx, via):
     if len(pos) < 2:
         return
     for src in pos[:-1]:
-        level, reason = judge(src, ctx)
+        level, reason = judge(src, ctx, moving=True)
         if level == DENY:
             ctx.add(DENY, "mv moving away " + reason)
     if pos[-1] == "/dev/null":
@@ -355,7 +431,7 @@ def check_chmod(args, ctx, via):
     if not any(a.startswith("-") and "R" in a for a in args):
         return
     for t in positional(args)[1:]:
-        level, reason = judge(t, ctx)
+        level, reason = judge(t, ctx, moving=True)
         if level == DENY:
             ctx.add(DENY, "recursive permission change on " + reason)
 
@@ -444,22 +520,31 @@ def check_git(args, ctx, via):
     def has(*names):
         return any(f == n or f.startswith(n + "=") for f in flags for n in names)
 
-    if sub == "clean" and ("f" in short_flags or has("--force")):
+    if sub == "clone":
+        ctx.cloned = True
+    elif sub == "clean" and ("f" in short_flags or has("--force")):
         ctx.add(ASK, "git clean -f deletes untracked files for good")
     elif sub == "reset" and has("--hard"):
         ctx.add(ASK, "git reset --hard throws away uncommitted work")
     elif sub == "push" and ("f" in short_flags or "d" in short_flags
                             or has("--force", "--force-with-lease", "--mirror", "--delete", "--prune")
                             or any(p.startswith((":", "+")) for p in pos)):
-        ctx.add(ASK, "git push that overwrites or deletes remote history or branches")
+        only_delete = not ("f" in short_flags or has("--force", "--force-with-lease", "--mirror", "--prune")
+                           or any(p.startswith("+") for p in pos))
+        if not (only_delete and ctx.merged_branch_delete):  # branch -d already proved it was merged
+            ctx.add(ASK, "git push that overwrites or deletes remote history or branches")
     elif sub == "branch" and ("D" in short_flags or ("d" in short_flags and "f" in short_flags)
                               or (has("--delete") and has("--force"))):
         ctx.add(ASK, "git branch -D deletes a branch even if it isn't merged")
-    elif sub == "checkout" and ("--" in rest or "." in pos or "f" in short_flags or has("--force")):
-        ctx.add(ASK, "git checkout that throws away uncommitted changes")
-    elif sub == "restore" and not (has("--staged") or "S" in short_flags) or (
-            sub == "restore" and (has("--worktree") or "W" in short_flags)):
-        ctx.add(ASK, "git restore throws away uncommitted changes")
+    elif sub == "branch" and ("d" in short_flags or has("--delete")):
+        ctx.merged_branch_delete = True
+    elif sub == "checkout" and ("f" in short_flags or has("--force") or "." in pos
+                                or ("--" in rest and not pos)):
+        ctx.add(ASK, "git checkout that throws away all uncommitted changes")
+    elif sub == "restore" and (not (has("--staged") or "S" in short_flags)
+                               or has("--worktree") or "W" in short_flags) and (
+            not pos or "." in pos or ":/" in pos):
+        ctx.add(ASK, "git restore that throws away all uncommitted changes")
     elif sub == "stash" and pos[:1] in (["drop"], ["clear"]):
         ctx.add(ASK, "git stash %s deletes stashed work" % pos[0])
     elif sub in ("filter-branch", "filter-repo"):
@@ -559,6 +644,9 @@ def unwrap(seg):
     i, via, assigns = 0, set(), []
     while i < len(seg):
         tok = seg[i]
+        if tok in KEYWORDS:
+            i += 1
+            continue
         if ASSIGNMENT.match(tok):
             if not via:
                 assigns.append(tok)
@@ -624,8 +712,12 @@ def split_segments(tokens):
     return segments, redirects
 
 
-def strip_heredocs(command):
-    """Drop here-document bodies (plain data) unless a shell is reading them."""
+def strip_heredocs(command, keep_unquoted=False):
+    """Drop here-document bodies (plain data) unless a shell is reading them.
+
+    keep_unquoted=True keeps the body of an unquoted here-doc (<<EOF), where the
+    shell still expands $(...) and backticks.
+    """
     lines, out, i = command.split("\n"), [], 0
     while i < len(lines):
         line = lines[i]
@@ -640,7 +732,8 @@ def strip_heredocs(command):
             body.append(lines[i])
             i += 1
         i += 1
-        if re.search(r"(^|[\s;&|(])(ba|z|da|k)?sh\b[^<]*<<", line):
+        shell_reads = re.search(r"(^|[\s;&|(])(ba|z|da|k)?sh\b[^<]*<<", line)
+        if shell_reads or (keep_unquoted and not match.group(1)):
             out.extend(body)
     return "\n".join(out)
 
@@ -675,10 +768,14 @@ def check_segment(seg, ctx, depth):
     if not name:
         remember(assigns, ctx)
         return
-    if name in ("export", "declare", "typeset", "local", "readonly"):
+    if name == "for" and len(args) >= 3 and args[1] == "in":
+        ctx.loops[args[0]] = args[2:]
+    elif name in ("export", "declare", "typeset", "local", "readonly"):
         remember([a for a in args if ASSIGNMENT.match(a)], ctx)
     elif name in ("cd", "pushd"):
         target = next((a for a in args if not a.startswith("-")), "~")
+        if not target.startswith(("/", "~", "$")):
+            ctx.cwd_trusted = False
         ctx.cwd, _ = resolve(target, ctx.cwd, ctx.vars)
     elif name == "popd":
         ctx.cwd = None
@@ -699,6 +796,8 @@ def check_segment(seg, ctx, depth):
         ctx.add(DENY, "%s formats a disk" % name)
     elif name in HANDLERS:
         HANDLERS[name](args, ctx, via)
+    if name in FILE_WRITERS and any(GUARD_FILES.search(a) for a in args):
+        ctx.add(ASK, "changes Claude's settings or this safety hook")
 
 
 def scan(command, ctx, depth):
@@ -706,12 +805,13 @@ def scan(command, ctx, depth):
         ctx.add(ASK, "a deeply nested shell command")
         return
     saved_cwd = ctx.cwd
-    for match in SUBSHELL.finditer(command):
+    for match in SUBSHELL.finditer(strip_heredocs(command, keep_unquoted=True)):
         inner = match.group(1) or match.group(2)
         if inner and inner.strip():
             scan(inner, ctx, depth + 1)
             ctx.cwd = saved_cwd
     text = strip_heredocs(command).replace("\\\n", " ").replace("\n", " ; ")
+    text = MKTEMP_ASSIGN.sub(lambda m: "%s=/tmp/mktemp.%s" % (m.group(1), m.group(1)), text)
     try:
         tokens = tokenize(text)
     except ValueError:
@@ -723,19 +823,32 @@ def scan(command, ctx, depth):
     for target in redirects:
         if DEVICE.match(target):
             ctx.add(DENY, "writing straight onto disk device %s" % target)
+        if GUARD_FILES.search(target):
+            ctx.add(ASK, "writes to Claude's settings or this safety hook")
     for seg in segments:
         check_segment(seg, ctx, depth)
     if depth:
         ctx.cwd = saved_cwd
 
 
+def names_root(command, root):
+    """True if command mentions root or one of its top two levels as a whole path, not deeper."""
+    return re.search(re.escape(root) + r"(/[^/\"'\s)]+){0,2}/?(?=[\"'\s)]|$|/\*)", command) is not None
+
+
 def evaluate(command, cwd):
     ctx = Findings(cwd)
+    ctx.merged_branch_delete = MERGE_CHECK.search(command) is not None
     for level, pattern, reason in RAW_CHECKS:
         if pattern.search(command):
             ctx.add(level, reason)
-    if GUARD_FILES.search(command) and WRITE_HINT.search(command):
-        ctx.add(ASK, "changes Claude's settings or this safety hook")
+    script_text = CD_ARG.sub("cd", command)  # the folder a script is run from is not a target
+    if RMTREE.search(command) and (RISKY_ROOT.search(script_text)
+                                   or any(names_root(script_text, p) or names_root(script_text, short(p))
+                                          for p in PROTECTED)):
+        ctx.add(ASK, "a script that deletes folders and names the home folder, a drive or a protected folder")
+    if GUARD_FILES.search(command) and SCRIPT_WRITE.search(command):
+        ctx.add(ASK, "a script that writes to Claude's settings or this safety hook")
     scan(command, ctx, 0)
     return ctx
 
